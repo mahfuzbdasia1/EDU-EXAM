@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Exam in Progress — EduExam</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body oncontextmenu="return false;" oncopy="return false;" oncut="return false;" onpaste="return false;">
+<nav class="navbar">
+  <div class="container"><span class="brand">📘 EduExam</span></div>
+</nav>
+
+<div class="container" style="padding-top:20px; max-width:800px;">
+  <div id="loadingBox" class="center-loading">Loading exam…</div>
+  <div id="examApp" style="display:none;">
+    <div class="exam-header">
+      <div><strong id="examTitle"></strong></div>
+      <div class="timer" id="timerDisplay">--:--</div>
+    </div>
+    <div id="saveStatus" style="font-size:12px; color:var(--muted); text-align:right; margin:-8px 0 8px;"></div>
+
+    <div class="nav-palette" id="navPalette"></div>
+
+    <div class="card" id="questionCard"></div>
+
+    <div style="display:flex; justify-content:space-between; margin-top:16px;">
+      <button class="btn secondary" id="prevBtn">&larr; Previous</button>
+      <button class="btn secondary" id="flagBtn">Flag for Review</button>
+      <button class="btn secondary" id="nextBtn">Next &rarr;</button>
+    </div>
+
+    <div class="card" style="margin-top:20px; text-align:center;">
+      <button class="btn success" id="submitBtn">Submit Exam</button>
+    </div>
+  </div>
+</div>
+
+<div id="submitModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); align-items:center; justify-content:center; z-index:100;">
+  <div class="card" style="max-width:400px;">
+    <h3>Submit exam?</h3>
+    <p id="unansweredMsg"></p>
+    <div style="display:flex; gap:10px; justify-content:flex-end;">
+      <button class="btn secondary" id="cancelSubmit">Cancel</button>
+      <button class="btn danger" id="confirmSubmit">Yes, Submit</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/utils.js"></script>
+<script src="js/draft-sync.js"></script>
+<script type="module">
+  import { db, doc, getDoc, setDoc, serverTimestamp } from "./js/firebase-init.js";
+
+  const params = new URLSearchParams(window.location.search);
+  const key = params.get("key");
+  const student = JSON.parse(sessionStorage.getItem("eduexam_student") || "null");
+
+  if (!key || !student || student.key !== key) {
+    window.location.href = "student-join.html";
+  }
+
+  const submissionId = `${key}__${EduUtils.participantKey(student?.name || "", student?.roll || "")}`;
+  const subRef = doc(db, "submissions", submissionId);
+  const DRAFT_KEY = `eduexam_draft_${submissionId}`;
+
+  let exam = null;
+  let answers = {};
+  let flagged = new Set();
+  let currentIndex = 0;
+  let secondsLeft = 0;
+  let timerHandle = null;
+  let tabSwitchCount = 0;
+  let submitted = false;
+  let submitting = false;
+  let syncer = null;
+  let lastEditMs = 0;
+  let localOk = true;
+
+  init().catch((err) => {
+    console.error(err);
+    document.getElementById("loadingBox").innerHTML = `<div class="alert error">Couldn't load the exam. Check your internet and <a href="" onclick="location.reload();return false;">reload</a>.</div>`;
+  });
+
+  async function init() {
+    // Block re-entry if already submitted
+    const existingSub = await getDoc(subRef);
+    if (existingSub.exists() && existingSub.data().status === "submitted") {
+      EduDraft.clear(DRAFT_KEY);
+      window.location.href = `exam-result.html?sub=${submissionId}`;
+      return;
+    }
+
+    const snap = await getDoc(doc(db, "exams", key));
+    if (!snap.exists() || snap.data().status !== "published") {
+      document.getElementById("loadingBox").innerHTML = `<div class="alert error">This exam is no longer available.</div>`;
+      return;
+    }
+    exam = snap.data();
+
+    let startedAt = Date.now();
+    let cloud = null;
+    if (existingSub.exists()) {
+      cloud = existingSub.data();
+      if (cloud.startedAtMs) startedAt = cloud.startedAtMs;
+    } else {
+      await setDoc(subRef, {
+        examId: key,
+        teacherId: exam.teacherId, // lets only the exam's owner list submissions (checked by Firestore rules)
+        studentName: student.name,
+        studentRoll: student.roll || null,
+        studentEmail: student.email || null,
+        answers: {},
+        flagged: [],
+        tabSwitchCount: 0,
+        status: "in-progress",
+        startedAt: serverTimestamp(),
+        startedAtMs: startedAt,
+        clientUpdatedAtMs: 0,
+      });
+    }
+
+    // Restore: use whichever copy is newer — this device's local draft or the cloud copy.
+    const local = EduDraft.load(DRAFT_KEY);
+    const cloudTs = (cloud && cloud.clientUpdatedAtMs) || 0;
+    let needsSync = false;
+    if (local && (local.updatedAtMs || 0) > cloudTs) {
+      answers = local.answers || {};
+      flagged = new Set(local.flagged || []);
+      tabSwitchCount = Math.max(local.tabSwitchCount || 0, (cloud && cloud.tabSwitchCount) || 0);
+      lastEditMs = local.updatedAtMs;
+      needsSync = true;
+    } else if (cloud) {
+      answers = cloud.answers || {};
+      flagged = new Set(cloud.flagged || []);
+      tabSwitchCount = cloud.tabSwitchCount || 0;
+      lastEditMs = cloudTs;
+    }
+
+    // Cloud sync cadence: ~10 syncs per exam, never faster than 30s, never slower than 5 min.
+    // (Every answer is still saved instantly on this device.)
+    const intervalMs = Math.min(300, Math.max(30, (exam.durationMinutes * 60) / 10)) * 1000;
+    syncer = EduDraft.createSyncer({ flush: cloudFlush, intervalMs, onStatus: showSyncStatus });
+    if (needsSync) syncer.markDirty();
+
+    const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+    secondsLeft = Math.max(0, exam.durationMinutes * 60 - elapsedSeconds);
+
+    document.getElementById("loadingBox").style.display = "none";
+    document.getElementById("examApp").style.display = "block";
+    document.getElementById("examTitle").textContent = exam.title;
+
+    renderPalette();
+    renderQuestion();
+    startTimer();
+    watchTabSwitches();
+  }
+
+  async function cloudFlush() {
+    await setDoc(subRef, {
+      answers, flagged: Array.from(flagged), tabSwitchCount, clientUpdatedAtMs: lastEditMs,
+    }, { merge: true });
+  }
+
+  function setSaveStatus(text, bad = false) {
+    const el = document.getElementById("saveStatus");
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = bad ? "var(--danger, #b91c1c)" : "var(--muted)";
+  }
+  function showSyncStatus(state) {
+    if (!localOk) { setSaveStatus("⚠ Your browser blocks local backup (private mode?). Don't close this tab.", true); return; }
+    if (state === "synced") setSaveStatus("✓ Saved · ☁ synced");
+    else if (state === "syncing") setSaveStatus("Syncing…");
+    else if (state === "error") setSaveStatus("⚠ Saved on this device, but cloud sync failed — retrying. Keep this tab open and don't clear browser data.", true);
+    else setSaveStatus("✓ Saved on this device");
+  }
+
+  // Every change: instant local save (free), then let the throttled syncer push to the cloud.
+  function saveProgress() {
+    if (submitted || !syncer) return;
+    lastEditMs = Date.now();
+    localOk = EduDraft.save(DRAFT_KEY, {
+      answers, flagged: Array.from(flagged), tabSwitchCount, updatedAtMs: lastEditMs,
+    });
+    syncer.markDirty();
+  }
+
+  function startTimer() {
+    updateTimerDisplay();
+    timerHandle = setInterval(() => {
+      secondsLeft--;
+      updateTimerDisplay();
+      if (secondsLeft <= 0) {
+        clearInterval(timerHandle);
+        doSubmit(true);
+      }
+    }, 1000);
+  }
+
+  function updateTimerDisplay() {
+    const el = document.getElementById("timerDisplay");
+    el.textContent = EduUtils.formatDuration(Math.max(0, secondsLeft));
+    el.className = "timer" + (secondsLeft > 60 ? " safe" : "");
+  }
+
+  function watchTabSwitches() {
+    document.addEventListener("visibilitychange", () => {
+      if (submitted || !syncer) return;
+      if (document.hidden) {
+        tabSwitchCount++;
+        saveProgress();            // counted locally — no immediate cloud write
+        syncer.flushIfStale(15000); // phone/app switch can precede the tab being killed: sync, at most every 15s
+      }
+    });
+  }
+
+  function renderPalette() {
+    const nav = document.getElementById("navPalette");
+    nav.innerHTML = exam.questions.map((q, i) => {
+      const cls = [
+        answers[q.id] !== undefined && answers[q.id] !== "" ? "answered" : "",
+        flagged.has(q.id) ? "flagged" : "",
+        i === currentIndex ? "current" : "",
+      ].join(" ");
+      return `<button data-idx="${i}" class="${cls}">${i + 1}</button>`;
+    }).join("");
+    nav.querySelectorAll("button").forEach(btn => btn.addEventListener("click", () => {
+      currentIndex = Number(btn.dataset.idx);
+      renderQuestion();
+    }));
+  }
+
+  function renderQuestion() {
+    const q = exam.questions[currentIndex];
+    const card = document.getElementById("questionCard");
+    let inputHtml = "";
+    if (q.type === "mcq" || q.type === "truefalse") {
+      inputHtml = q.options.map((opt, i) => `
+        <label class="option-choice">
+          <input type="radio" name="ans" value="${EduUtils.escapeHtml(opt)}" ${answers[q.id] === opt ? "checked" : ""}>
+          ${EduUtils.escapeHtml(opt)}
+        </label>`).join("");
+    } else if (q.type === "short") {
+      inputHtml = `<input type="text" id="shortAns" value="${EduUtils.escapeHtml(answers[q.id] || "")}" placeholder="Type your answer">`;
+    }
+    card.innerHTML = `
+      <div style="color:var(--muted); font-size:13px; margin-bottom:8px;">
+        Question ${currentIndex + 1} of ${exam.questions.length} &middot; ${q.points} point(s)
+      </div>
+      <h3 style="margin-top:0;">${EduUtils.escapeHtml(q.text)}</h3>
+      ${inputHtml}`;
+
+    if (q.type === "mcq" || q.type === "truefalse") {
+      card.querySelectorAll('input[name="ans"]').forEach(el => el.addEventListener("change", () => {
+        answers[q.id] = el.value;
+        saveProgress(); renderPalette();
+      }));
+    } else if (q.type === "short") {
+      document.getElementById("shortAns").addEventListener("input", (e) => {
+        answers[q.id] = e.target.value;
+        saveProgress(); renderPalette();
+      });
+    }
+
+    document.getElementById("flagBtn").textContent = flagged.has(q.id) ? "Unflag" : "Flag for Review";
+  }
+
+  document.getElementById("prevBtn").addEventListener("click", () => {
+    if (currentIndex > 0) { currentIndex--; renderQuestion(); renderPalette(); }
+  });
+  document.getElementById("nextBtn").addEventListener("click", () => {
+    if (currentIndex < exam.questions.length - 1) { currentIndex++; renderQuestion(); renderPalette(); }
+  });
+  document.getElementById("flagBtn").addEventListener("click", () => {
+    const qid = exam.questions[currentIndex].id;
+    if (flagged.has(qid)) flagged.delete(qid); else flagged.add(qid);
+    saveProgress(); renderQuestion(); renderPalette();
+  });
+
+  document.getElementById("submitBtn").addEventListener("click", () => {
+    const unanswered = exam.questions.filter(q => answers[q.id] === undefined || answers[q.id] === "").length;
+    document.getElementById("unansweredMsg").textContent = unanswered > 0
+      ? `You have ${unanswered} unanswered question(s). Submit anyway?`
+      : "You've answered all questions. Ready to submit?";
+    document.getElementById("submitModal").style.display = "flex";
+  });
+  document.getElementById("cancelSubmit").addEventListener("click", () => {
+    document.getElementById("submitModal").style.display = "none";
+  });
+  document.getElementById("confirmSubmit").addEventListener("click", () => doSubmit(false));
+
+  async function doSubmit(auto) {
+    if (submitted || submitting) return;
+    submitting = true;
+    if (syncer) syncer.stop(); // the final write below carries everything
+    const confirmBtn = document.getElementById("confirmSubmit");
+    const submitBtn = document.getElementById("submitBtn");
+    confirmBtn.disabled = true; submitBtn.disabled = true;
+    submitBtn.textContent = "Submitting…";
+
+    const { autoScore, autoMax } = EduUtils.gradeSubmission(exam, answers);
+    const payload = {
+      answers, flagged: Array.from(flagged), tabSwitchCount,
+      autoScore, autoMax, totalScore: autoScore, maxScore: autoMax,
+      status: "submitted",
+      submittedAt: serverTimestamp(),
+      autoSubmitted: auto,
+      clientUpdatedAtMs: Date.now(),
+    };
+
+    // Retry a few times with backoff before giving up — a flaky connection at the
+    // last second must not lose the student's exam.
+    const delays = [0, 1000, 2500, 5000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt]) await new Promise(r => setTimeout(r, delays[attempt]));
+      try {
+        await setDoc(subRef, payload, { merge: true });
+        submitted = true; // only mark done AFTER the write really succeeded
+        clearInterval(timerHandle);
+        EduDraft.clear(DRAFT_KEY);
+        document.getElementById("submitModal").style.display = "none";
+        window.location.href = `exam-result.html?sub=${submissionId}`;
+        return;
+      } catch (err) {
+        console.error(`submit attempt ${attempt + 1} failed`, err);
+      }
+    }
+
+    // All retries failed: unlock the UI so the student can try again manually.
+    submitting = false;
+    confirmBtn.disabled = false; submitBtn.disabled = false;
+    submitBtn.textContent = "Retry Submit";
+    document.getElementById("submitModal").style.display = "none";
+    toast("Couldn't submit — check your internet and press “Retry Submit”. Your answers are safe on this device.", "error");
+    setSaveStatus("⚠ Submit failed. Press “Retry Submit” once your internet is back.", true);
+    if (auto) {
+      // Timer already hit 0: keep retrying in the background every 10s.
+      setTimeout(() => doSubmit(true), 10000);
+    }
+  }
+</script>
+</body>
+</html>

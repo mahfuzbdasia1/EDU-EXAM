@@ -1,0 +1,88 @@
+rules_version = '2';
+
+// ============================================================
+// EduExam Firestore Security Rules  (এই ফাইলটা Firebase Console ->
+// Firestore Database -> Rules ট্যাবে পুরোটা paste করে "Publish" করো)
+//
+// যা নিশ্চিত করে:
+// - শুধু ইমেইল-ভেরিফাইড teacher exam/battle তৈরি, এডিট, ডিলিট ও list করতে পারবে।
+// - একজন teacher শুধু নিজের exam/battle-ই list করতে পারবে।
+// - Student রা exam key জেনে single exam পড়তে পারবে; কেউ পুরো exam list browse করতে পারবে না।
+// - Submission-এ teacherId থাকে (exam-এর মালিকের, rules নিজেই যাচাই করে)।
+//   তাই শুধু ওই exam-এর মালিক teacher-ই submissions list করতে পারবে — অন্য teacher
+//   student-দের নাম/ইমেইল/roll দেখতে পারবে না।
+// - Submission "submitted" হয়ে গেলে student আর বদলাতে পারবে না।
+//
+// ⚠️ পরিচিত সীমাবদ্ধতা (Cloud Functions ছাড়া ঠিক করা যায় না): grading এখনও
+//   student-এর ব্রাউজারে হয় এবং exam doc-এ correctAnswers থাকে।
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // লগইন করা এবং ইমেইল-ভেরিফাইড teacher
+    function verifiedTeacher() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    match /exams/{examId} {
+      // exam key জানলে single doc পড়া যাবে (list/browse নয়)
+      allow get: if true;
+
+      // শুধু নিজের exam list করা যাবে
+      allow list: if verifiedTeacher() && resource.data.teacherId == request.auth.uid;
+
+      allow create: if verifiedTeacher()
+                    && request.resource.data.teacherId == request.auth.uid;
+
+      allow update: if verifiedTeacher()
+                    && resource.data.teacherId == request.auth.uid
+                    && request.resource.data.teacherId == request.auth.uid;
+
+      allow delete: if verifiedTeacher()
+                    && resource.data.teacherId == request.auth.uid;
+    }
+
+    match /submissions/{subId} {
+      // Create: শুধু "in-progress", স্কোর ছাড়া, এবং teacherId অবশ্যই ওই exam-এর
+      // আসল মালিকের হতে হবে (exam doc থেকে rules নিজে মিলিয়ে দেখে)।
+      allow create: if request.resource.data.status == "in-progress"
+                    && !request.resource.data.keys().hasAny(["totalScore", "autoScore", "autoMax", "maxScore"])
+                    && request.resource.data.teacherId
+                       == get(/databases/$(database)/documents/exams/$(request.resource.data.examId)).data.teacherId;
+
+      // Update:
+      //  1) exam-এর মালিক teacher (grading ইত্যাদি)
+      //  2) যে কেউ শুধু "reportEmailSent" ফ্ল্যাগ বদলাতে পারবে
+      //  3) Student autosave/submit — যতক্ষণ "in-progress"; examId/teacherId বদলানো যাবে না
+      allow update: if (verifiedTeacher() && resource.data.teacherId == request.auth.uid)
+                    || request.resource.data.diff(resource.data).affectedKeys().hasOnly(["reportEmailSent"])
+                    || (resource.data.status == "in-progress"
+                        && request.resource.data.examId == resource.data.examId
+                        && request.resource.data.teacherId == resource.data.teacherId);
+
+      // Result page-এর জন্য নির্দিষ্ট doc আইডি জানলে পড়া যাবে।
+      allow get: if true;
+
+      // List: শুধু exam-এর মালিক (query-তে where("teacherId","==",uid) থাকতে হবে)।
+      allow list: if verifiedTeacher() && resource.data.teacherId == request.auth.uid;
+    }
+
+    match /battles/{code} {
+      allow get: if true;
+      allow list: if verifiedTeacher() && resource.data.mentorId == request.auth.uid;
+      allow create: if verifiedTeacher() && request.resource.data.mentorId == request.auth.uid;
+      allow update: if verifiedTeacher() && resource.data.mentorId == request.auth.uid;
+      allow delete: if verifiedTeacher() && resource.data.mentorId == request.auth.uid;
+    }
+
+    match /battleParticipants/{id} {
+      // Student-রা লগইন ছাড়াই join/autosave করে; mentor team assign করে (update)।
+      // battleCode ৬-অক্ষরের র‍্যান্ডম (~১০০ কোটি সম্ভাবনা), তাই practically private।
+      allow create: if true;
+      allow update: if true;
+      allow get: if true;
+      allow list: if true;
+    }
+  }
+}

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Teacher Login — EduExam</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<nav class="navbar">
+  <div class="container">
+    <a href="index.html" class="brand">📘 EduExam</a>
+    <div class="nav-links"><a href="index.html">Home</a></div>
+  </div>
+</nav>
+
+<div class="container">
+  <div class="card form-narrow">
+    <h2 id="formTitle" style="text-align:center;">Teacher Login</h2>
+    <p id="formSub" style="text-align:center; color:var(--muted); font-size:14px;">
+      Log in to manage your exams.
+    </p>
+
+    <div id="alertBox"></div>
+
+    <form id="authForm">
+      <label for="email">Email</label>
+      <input type="email" id="email" required placeholder="you@school.edu">
+
+      <label for="password">Password</label>
+      <input type="password" id="password" required placeholder="At least 6 characters" minlength="6">
+
+      <button type="submit" class="btn block" id="submitBtn">Log In</button>
+    </form>
+
+    <p style="text-align:center; margin-top:16px; font-size:14px;" id="toggleRow">
+      <span id="toggleText">Don't have an account?</span>
+      <a href="#" id="toggleMode">Sign up</a>
+    </p>
+
+    <div id="verifyPanel" style="display:none; text-align:center;">
+      <h3 style="margin-top:0;">📧 Verify your email</h3>
+      <p id="verifyMsg" style="color:var(--muted); font-size:14px;"></p>
+      <p style="color:var(--muted); font-size:13px;">Can't see it? Check your Spam / Promotions folder.</p>
+      <button class="btn block" id="verifiedBtn">I've verified — Continue</button>
+      <button class="btn secondary block" id="resendBtn" style="margin-top:10px;">Send verification email</button>
+      <p style="margin-top:14px;"><a href="#" id="otherAccount" style="font-size:14px;">Use a different account</a></p>
+    </div>
+  </div>
+</div>
+
+<footer>Built for educational use — free forever. &copy; EduExam</footer>
+
+<script type="module">
+  import {
+    auth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged,
+    sendEmailVerification, signOut,
+  } from "./js/firebase-init.js";
+
+  let mode = "login"; // or "signup"
+
+  const form = document.getElementById("authForm");
+  const toggleRow = document.getElementById("toggleRow");
+  const toggleMode = document.getElementById("toggleMode");
+  const toggleText = document.getElementById("toggleText");
+  const formTitle = document.getElementById("formTitle");
+  const formSub = document.getElementById("formSub");
+  const submitBtn = document.getElementById("submitBtn");
+  const alertBox = document.getElementById("alertBox");
+  const verifyPanel = document.getElementById("verifyPanel");
+  const verifyMsg = document.getElementById("verifyMsg");
+  const resendBtn = document.getElementById("resendBtn");
+
+  function showAlert(msg, type = "error") {
+    alertBox.innerHTML = `<div class="alert ${type}">${msg}</div>`;
+  }
+
+  toggleMode.addEventListener("click", (e) => {
+    e.preventDefault();
+    mode = mode === "login" ? "signup" : "login";
+    if (mode === "signup") {
+      formTitle.textContent = "Teacher Sign Up";
+      formSub.textContent = "Create a free teacher account. We'll email you a link to verify your address.";
+      submitBtn.textContent = "Sign Up";
+      toggleText.textContent = "Already have an account?";
+      toggleMode.textContent = "Log in";
+    } else {
+      formTitle.textContent = "Teacher Login";
+      formSub.textContent = "Log in to manage your exams.";
+      submitBtn.textContent = "Log In";
+      toggleText.textContent = "Don't have an account?";
+      toggleMode.textContent = "Sign up";
+    }
+    alertBox.innerHTML = "";
+  });
+
+  // ---- Email-verification step (keeps bots / typo'd emails from becoming teachers) ----
+  function showVerifyPanel(user, justSent) {
+    form.style.display = "none";
+    toggleRow.style.display = "none";
+    formSub.style.display = "none";
+    formTitle.textContent = "Teacher Account";
+    verifyPanel.style.display = "block";
+    verifyMsg.innerHTML = justSent
+      ? `We sent a verification link to <strong>${user.email}</strong>. Open it, then come back and press the button below.`
+      : `<strong>${user.email}</strong> isn't verified yet. Press “Send verification email”, open the link, then come back and press “I've verified”.`;
+    if (justSent) startCooldown();
+  }
+
+  let cooldownTimer = null;
+  function startCooldown(seconds = 60) {
+    let left = seconds;
+    resendBtn.disabled = true;
+    clearInterval(cooldownTimer);
+    cooldownTimer = setInterval(() => {
+      left--;
+      if (left <= 0) { clearInterval(cooldownTimer); resendBtn.disabled = false; resendBtn.textContent = "Send verification email again"; }
+      else resendBtn.textContent = `Send again in ${left}s`;
+    }, 1000);
+    resendBtn.textContent = `Send again in ${left}s`;
+  }
+
+  resendBtn.addEventListener("click", async () => {
+    const user = auth.currentUser;
+    if (!user) return;
+    try {
+      await sendEmailVerification(user);
+      showAlert("Verification email sent. Check your inbox (and Spam).", "info");
+      startCooldown();
+    } catch (err) {
+      showAlert(err.code === "auth/too-many-requests"
+        ? "Too many requests — please wait a few minutes before trying again."
+        : "Couldn't send the email right now. Please try again shortly.");
+    }
+  });
+
+  document.getElementById("verifiedBtn").addEventListener("click", async () => {
+    const user = auth.currentUser;
+    if (!user) return;
+    try {
+      await user.reload();
+      if (!auth.currentUser.emailVerified) {
+        showAlert("Not verified yet — open the link in the email first, then press this button again.");
+        return;
+      }
+      await auth.currentUser.getIdToken(true); // refresh token so Firestore rules see email_verified = true
+      window.location.href = "teacher-dashboard.html";
+    } catch (err) {
+      showAlert("Couldn't check verification. Please try again.");
+    }
+  });
+
+  document.getElementById("otherAccount").addEventListener("click", async (e) => {
+    e.preventDefault();
+    await signOut(auth);
+    window.location.reload();
+  });
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = document.getElementById("email").value.trim();
+    const password = document.getElementById("password").value;
+    submitBtn.disabled = true;
+    alertBox.innerHTML = "";
+    try {
+      if (mode === "signup") {
+        const cred = await createUserWithEmailAndPassword(auth, email, password);
+        await sendEmailVerification(cred.user);
+        showVerifyPanel(cred.user, true);
+      } else {
+        const cred = await signInWithEmailAndPassword(auth, email, password);
+        if (cred.user.emailVerified) {
+          window.location.href = "teacher-dashboard.html";
+        } else {
+          showVerifyPanel(cred.user, false);
+        }
+      }
+    } catch (err) {
+      showAlert(friendlyError(err.code));
+      submitBtn.disabled = false;
+    }
+  });
+
+  function friendlyError(code) {
+    const map = {
+      "auth/email-already-in-use": "This email is already registered — try logging in instead.",
+      "auth/invalid-email": "Please enter a valid email address.",
+      "auth/weak-password": "Password should be at least 6 characters.",
+      "auth/user-not-found": "No account found with this email. Try signing up.",
+      "auth/wrong-password": "Incorrect password. Please try again.",
+      "auth/invalid-credential": "Incorrect email or password.",
+      "auth/too-many-requests": "Too many attempts. Please wait a few minutes and try again.",
+    };
+    return map[code] || "Something went wrong. Please check your Firebase setup (see README.md) and try again.";
+  }
+
+  // Already logged in? Verified -> dashboard. Not verified -> show the verify step.
+  onAuthStateChanged(auth, (user) => {
+    if (!user) return;
+    if (user.emailVerified) window.location.href = "teacher-dashboard.html";
+    else if (verifyPanel.style.display === "none") showVerifyPanel(user, false);
+  });
+</script>
+</body>
+</html>
